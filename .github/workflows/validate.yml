@@ -1,0 +1,135 @@
+name: Validate Queries
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read parser manifest
+        id: manifest
+        run: |
+          echo "lang=$(jq -r '.lang // ""' parser.json)"                     >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.url // ""' parser.json)"                       >> "$GITHUB_OUTPUT"
+          echo "min_version=$(jq -r '.min_version // "HEAD"' parser.json)"   >> "$GITHUB_OUTPUT"
+          echo "location=$(jq -r '.location // ""' parser.json)"             >> "$GITHUB_OUTPUT"
+          echo "queries_only=$(jq -r '.queries_only // false' parser.json)"  >> "$GITHUB_OUTPUT"
+
+      - name: Install tree-sitter CLI
+        uses: tree-sitter/setup-action/cli@v2
+
+      - name: Build parser
+        if: steps.manifest.outputs.queries_only != 'true' && steps.manifest.outputs.url != ''
+        env:
+          URL:      ${{ steps.manifest.outputs.url }}
+          REF:      ${{ steps.manifest.outputs.min_version }}
+          LOCATION: ${{ steps.manifest.outputs.location }}
+          LANG:     ${{ steps.manifest.outputs.lang }}
+        run: |
+          curl -sL "$URL/archive/$REF.tar.gz" -o parser.tar.gz
+          # Detect the actual extracted dir name from the archive (handles HEAD, branch names, semver)
+          SRC=$(tar -tf parser.tar.gz 2>/dev/null | head -1 | cut -d/ -f1 || true)
+          tar -xzf parser.tar.gz
+          [ -n "$LOCATION" ] && SRC="$SRC/$LOCATION"
+          mkdir -p /tmp/ts-parsers
+          tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$SRC"
+
+      - name: Resolve inherited query dependencies
+        shell: bash
+        run: |
+          mkdir -p /tmp/ts-parsers query-deps
+
+          # Fetch files for a lang from its public GitHub repo — no auth needed
+          # Query files go into deps/<lang>/ inside the workspace so ts_query_ls
+          # can discover them via language_retrieval_patterns.
+          fetch_lang() {
+            local LANG="$1"
+            local ORG="neovim-treesitter"
+            local REPO_NAME="nvim-treesitter-queries-${LANG}"
+            local RAW_BASE="https://raw.githubusercontent.com/${ORG}/${REPO_NAME}/main"
+            local API_BASE="https://api.github.com/repos/${ORG}/${REPO_NAME}"
+
+            echo "==> Fetching dependency: $LANG"
+            mkdir -p "query-deps/${LANG}"
+
+            # List and download query files via unauthenticated API (public repos)
+            local FILES
+            FILES=$(curl -sfL "${API_BASE}/contents/queries" \
+              -H "Accept: application/vnd.github+json" \
+              | jq -r '.[].name' 2>/dev/null || true)
+
+            for FNAME in $FILES; do
+              curl -sfL "${RAW_BASE}/queries/${FNAME}" \
+                -o "query-deps/${LANG}/${FNAME}" || true
+            done
+            echo "  downloaded $(ls query-deps/${LANG}/ 2>/dev/null | wc -l) query files for ${LANG}"
+
+            # Fetch parser.json and build parser
+            local PJSON PURL PREF PLOC
+            PJSON=$(curl -sfL "${RAW_BASE}/parser.json" 2>/dev/null || echo '{}')
+            PURL=$(echo "$PJSON" | jq -r '.url // ""')
+            PREF=$(echo "$PJSON" | jq -r '.min_version // "HEAD"')
+            PLOC=$(echo "$PJSON" | jq -r '.location // ""')
+
+            if [ -n "$PURL" ]; then
+              curl -sL "${PURL}/archive/${PREF}.tar.gz" -o "dep-${LANG}.tar.gz"
+              local PSRC
+              PSRC=$(tar -tf "dep-${LANG}.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1 || true)
+              tar -xzf "dep-${LANG}.tar.gz"
+              [ -n "$PLOC" ] && PSRC="$PSRC/$PLOC"
+              tree-sitter build --output "/tmp/ts-parsers/${LANG}.so" "$PSRC" \
+                || echo "WARN: failed to build parser for $LANG"
+            fi
+          }
+
+          # BFS over ; inherits: graph — handles chains of any depth
+          VISITED=""
+          QUEUE=$(grep -rh '^; inherits:' queries/*.scm 2>/dev/null \
+            | sed 's/; inherits: *//' | tr ',' '\n' | sed 's/?$//' \
+            | tr -d ' ' | sort -u | tr '\n' ' ' || true)
+
+          while [ -n "$QUEUE" ]; do
+            NEXT_QUEUE=""
+            for DEP in $QUEUE; do
+              # Skip if already visited
+              case " $VISITED " in *" $DEP "*) continue ;; esac
+              VISITED="$VISITED $DEP"
+
+              fetch_lang "$DEP"
+
+              # Discover next-level deps from the just-downloaded queries
+              NEW=$(grep -rh '^; inherits:' "query-deps/${DEP}/" 2>/dev/null \
+                | sed 's/; inherits: *//' | tr ',' '\n' | sed 's/?$//' \
+                | tr -d ' ' | sort -u | tr '\n' ' ' || true)
+              NEXT_QUEUE="$NEXT_QUEUE $NEW"
+            done
+            QUEUE="$NEXT_QUEUE"
+          done
+
+      - name: Write .tsqueryrc.json
+        run: |
+          cat > .tsqueryrc.json <<'EOF'
+          {
+            "parser_install_directories": ["/tmp/ts-parsers"],
+            "supported_abi_versions": { "start": 13, "end": 15 },
+            "language_retrieval_patterns": [
+              "nvim-treesitter-queries-([^/]+)/queries/[^/]+\\.scm$",
+              "query-deps/([^/]+)/[^/]+\\.scm$"
+            ]
+          }
+          EOF
+
+      - name: Install ts_query_ls
+        run: |
+          curl -fL https://github.com/ribru17/ts_query_ls/releases/latest/download/ts_query_ls-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz
+
+      - name: Check queries
+        run: ./ts_query_ls check queries/
