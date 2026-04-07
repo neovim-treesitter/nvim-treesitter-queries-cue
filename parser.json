@@ -1,9 +1,9 @@
 {
-  "parser_version": "20bb9195dac00b64c00ee494812abf3bf76f4181",
-  "location": null,
-  "lang": "cue",
   "generate": null,
   "generate_from_json": null,
   "url": "https://github.com/eonpatapon/tree-sitter-cue",
-  "semver": false
+  "semver": false,
+  "parser_version": "20bb9195dac00b64c00ee494812abf3bf76f4181",
+  "location": null,
+  "lang": "cue"
 }
