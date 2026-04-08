@@ -1,6 +1,6 @@
 {
-  "semver": false,
   "parser_version": "20bb9195dac00b64c00ee494812abf3bf76f4181",
   "lang": "cue",
-  "url": "https://github.com/eonpatapon/tree-sitter-cue"
+  "url": "https://github.com/eonpatapon/tree-sitter-cue",
+  "semver": false
 }
